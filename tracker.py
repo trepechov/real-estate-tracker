@@ -403,6 +403,7 @@ def main():
     parser = argparse.ArgumentParser(description="Real Estate Scraper for imot.bg")
     parser.add_argument("--urls", nargs="+", help="List of imot.bg search URLs")
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT, help="Output filename in reports/ folder")
+    parser.add_argument("--mode", type=str, choices=["csv", "sheets"], default="csv", help="Storage mode: 'csv' (local) or 'sheets' (Google Sheets)")
     args = parser.parse_args()
     
     if not args.urls:
@@ -415,19 +416,23 @@ def main():
     today = date.today()
     print(f"Starting Scrape - {today}")
     
-    # Check for Google Sheets Config
+    # Storage selection logic
     sheet_id = os.environ.get("SPREADSHEET_ID")
     has_creds = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON")
     
-    use_sheets = sheet_id and has_creds
-    
-    if use_sheets:
+    # Decide using mode flag AND check if sheets config is actually available
+    if args.mode == "sheets":
+        if not (sheet_id and has_creds):
+            print("Error: Google Sheets configuration is missing (SPREADSHEET_ID or GSPREAD_SERVICE_ACCOUNT_JSON).")
+            return
         # Clean output name for sheet tab (no .csv)
         sheet_name = args.output.replace(".csv", "") if args.output else "listings"
         print(f"Target: Google Sheet ID '{sheet_id}' (Tab: '{sheet_name}')")
+        use_sheets = True
     else:
         output_file = args.output if args.output.endswith(".csv") else f"{args.output}.csv"
         print(f"Target: Local CSV '{REPORTS_DIR}/{output_file}'")
+        use_sheets = False
     
     scraped = scrape_all(args.urls)
     if not scraped:
