@@ -1,0 +1,59 @@
+name: Multi-Area Real Estate Scrape
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Every day at 00:00 UTC
+  workflow_dispatch:
+    inputs:
+      area_name:
+        description: 'Name of the area (used for filename)'
+        required: true
+        default: 'manual_scrape'
+      search_urls:
+        description: 'Space-separated imot.bg search URLs'
+        required: true
+        default: 'https://www.imot.bg/obiavi/prodazhbi/grad-sofiya/krasna-polyana-1/dvustaen?type_home=3~&raioni=112~113~'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        area: 
+          - name: "krasna_polyana"
+            urls: "https://www.imot.bg/obiavi/prodazhbi/grad-sofiya/krasna-polyana-1/dvustaen?type_home=3~&raioni=112~113~ https://www.imot.bg/obiavi/prodazhbi/grad-sofiya/krasna-polyana-1/tristaen?type_home=3~&raioni=112~113~"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install chromium
+
+      - name: Run tracker (Scheduled/Matrix)
+        if: github.event_name == 'schedule'
+        run: python tracker.py --urls ${{ matrix.area.urls }} --output "${{ matrix.area.name }}.csv"
+
+      - name: Run tracker (Manual)
+        if: github.event_name == 'workflow_dispatch'
+        run: python tracker.py --urls ${{ github.event.inputs.search_urls }} --output "${{ github.event.inputs.area_name }}.csv"
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update daily real estate reports [skip ci]"
+          file_pattern: "reports/*.csv"

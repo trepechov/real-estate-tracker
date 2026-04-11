@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Real Estate Tracker
+General purpose scraper for imot.bg. Supports custom URLs and CSV output in reports/ folder.
+"""
+
+import re
+import time
+import random
+import os
+import argparse
+import csv
+from datetime import date, datetime
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+from playwright_stealth import Stealth
+
+# ─────────────────────────────────────────────
+# CONSTANTS & DEFAULTS
+# ─────────────────────────────────────────────
+DEFAULT_OUTPUT = "listings.csv"
+REPORTS_DIR = "reports"
+
+# Column definitions (Schema)
+COLUMN_HEADERS = [
+    "ID", "URL", "Location", "Type", "Area", "FloorTotal",
+    "Price", "PriceSQM", "vsAvg", "Status",
+    "FirstSeen", "DateSold", "DaysMarket", "LastSeen",
+]
+
+# Status Labels
+STATUS_NEW        = "new"
+STATUS_1W         = "1 week"
+STATUS_2W         = "2 weeks"
+STATUS_3W         = "3 weeks"
+STATUS_4W         = "4 weeks"
+STATUS_SOLD       = "sold"
+STATUS_SOLD_Q     = "sold?"
+
+# ─────────────────────────────────────────────
+# BROWSER AUTOMATION
+# ─────────────────────────────────────────────
+
+def scroll_page(page):
+    """Scroll down slowly to trigger any lazy loading."""
+    current_height = page.evaluate("document.body.scrollHeight")
+    for i in range(1, 4):
+        page.evaluate(f"window.scrollTo(0, {current_height * i / 4})")
+        time.sleep(random.uniform(0.5, 1.0))
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(1)
+
+def scrape_page(page, url):
+    """Scrape a results page using Playwright."""
+    print(f"  Navigating to: {url}")
+    try:
+        page.goto(url, wait_until="networkidle", timeout=60000)
+    except Exception as e:
+        print(f"  [ERROR] Failed to load {url}: {e}")
+        return []
+    
+    # Check for cookie consent
+    try:
+        consent_selector = "button:has-text('Приемам'), .didomi-continue-without-agreeing"
+        if page.is_visible(consent_selector, timeout=2000):
+            page.click(consent_selector)
+            time.sleep(1)
+    except:
+        pass
+
+    scroll_page(page)
+    
+    content = page.content()
+    soup = BeautifulSoup(content, "html.parser")
+    items = soup.select("div[id^='ida']")
+    properties = []
+
+    for item in items:
+        prop_id = item.get("id", "").replace("ida", "")
+        if not prop_id: continue
+
+        # URL Extraction
+        link_el = item.select_one("a[href*='obiava']")
+        raw_href = link_el["href"] if link_el else ""
+        if not raw_href:
+            prop_url = ""
+        elif raw_href.startswith("http"):
+            prop_url = raw_href
+        elif raw_href.startswith("//"):
+            prop_url = "https:" + raw_href
+        else:
+            prop_url = "https://www.imot.bg" + (raw_href if raw_href.startswith("/") else "/" + raw_href)
+
+        # Price Extraction (Take only EUR part, ignore BGN)
+        price_el = item.select_one(".price")
+        price_text = price_el.get_text(" ", strip=True) if price_el else ""
+        # Match the first number sequence (EUR) and ignore the rest (BGN usually follows)
+        price_match = re.search(r"^([\d\s]+)", price_text)
+        price_clean = re.sub(r"[^\d]", "", price_match.group(1)) if price_match else ""
+        price_parsed = int(price_clean) if price_clean else None
+
+        full_text = item.get_text(" ", strip=True)
+        area_match = re.search(r"(\d+)\s*кв\.м", full_text)
+        area = int(area_match.group(1)) if area_match else None
+
+        floor_match = re.search(r"(\d+)-[а-я]+\s+ет\.\s*от\s*(\d+)", full_text)
+        floor = int(floor_match.group(1)) if floor_match else None
+        total_floors = int(floor_match.group(2)) if floor_match else None
+
+        type_match = re.search(r"Продава\s+(\d-СТАЕН)", full_text)
+        prop_type = type_match.group(1) if type_match else ""
+
+        loc_el = item.select_one("location") or item.select_one(".location")
+        location = loc_el.get_text(strip=True) if loc_el else ""
+
+        price_per_sqm = round(price_parsed / area) if price_parsed and area else None
+
+        properties.append({
+            "ID": prop_id,
+            "URL": prop_url,
+            "Location": location,
+            "Type": prop_type,
+            "Area": area,
+            "FloorTotal": f"{floor}/{total_floors}" if floor else "",
+            "Price": price_parsed,
+            "PriceSQM": price_per_sqm,
+        })
+
+    return properties
+
+def scrape_all(urls):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
+        Stealth().apply_stealth_sync(page)
+
+        all_props = []
+        seen_ids = set()
+
+        for base_url in urls:
+            print(f"\nProcessing Search: {base_url}")
+            try:
+                page.goto(base_url, wait_until="networkidle", timeout=60000)
+                soup = BeautifulSoup(page.content(), "html.parser")
+                
+                # Get total pages
+                page_links = [a.get_text(strip=True) for a in soup.select("a") if re.match(r"^\d+$", a.get_text(strip=True))]
+                nums = [int(p) for p in page_links if p.isdigit()]
+                total = max(nums) if nums else 1
+                
+                print(f"  Detected {total} pages")
+
+                for page_num in range(1, total + 1):
+                    if page_num == 1:
+                        page_url = base_url
+                    else:
+                        parts = base_url.split("?", 1)
+                        page_url = f"{parts[0]}/p-{page_num}?{parts[1]}" if len(parts) > 1 else f"{parts[0]}/p-{page_num}"
+                    
+                    print(f"  Scraping Page {page_num}/{total}")
+                    props = scrape_page(page, page_url)
+                    for p_dict in props:
+                        if p_dict["ID"] not in seen_ids:
+                            seen_ids.add(p_dict["ID"])
+                            all_props.append(p_dict)
+                    time.sleep(random.uniform(2, 4))
+            except Exception as e:
+                print(f"  [ERROR] Failed to process {base_url}: {e}")
+
+        browser.close()
+        return all_props
+
+# ─────────────────────────────────────────────
+# DATA STORAGE (Abstracted for future Google Sheets)
+# ─────────────────────────────────────────────
+
+class CSVDataStore:
+    def __init__(self, filename):
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        self.filepath = os.path.join(REPORTS_DIR, filename)
+
+    def load_existing(self):
+        """Load history from CSV if it exists."""
+        if not os.path.exists(self.filepath):
+            return {}
+        
+        history = {}
+        with open(self.filepath, mode='r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                history[row["ID"]] = row
+        return history
+
+    def save(self, properties, today):
+        """Update history and save to cumulative CSV."""
+        history = self.load_existing()
+        today_str = today.strftime("%Y-%m-%d")
+        scraped_ids = {p["ID"] for p in properties}
+
+        # 1. Update existing and mark sold
+        for pid, data in history.items():
+            if pid not in scraped_ids:
+                # Mark as sold if not previously sold
+                if data["Status"] not in (STATUS_SOLD, STATUS_SOLD_Q):
+                    data["Status"] = STATUS_SOLD
+                    data["DateSold"] = today_str
+                    # Compute days on market
+                    try:
+                        fs = datetime.strptime(data["FirstSeen"], "%Y-%m-%d").date()
+                        data["DaysMarket"] = (today - fs).days
+                    except:
+                        pass
+            else:
+                # Update last seen for active
+                data["LastSeen"] = today_str
+
+        # 2. Integrate today's scrape
+        for p in properties:
+            pid = p["ID"]
+            if pid in history:
+                # Update price and compute status
+                data = history[pid]
+                data["Price"] = p["Price"]
+                data["PriceSQM"] = p["PriceSQM"]
+                data["Status"] = self.compute_status(data["FirstSeen"], today)
+                data["LastSeen"] = today_str
+            else:
+                # New listing
+                new_row = {h: "" for h in COLUMN_HEADERS}
+                new_row.update(p)
+                new_row.update({
+                    "Status": STATUS_NEW,
+                    "FirstSeen": today_str,
+                    "LastSeen": today_str,
+                    "DateSold": "",
+                    "DaysMarket": "",
+                    "vsAvg": "", # Could be calculated if needed
+                })
+                history[pid] = new_row
+
+        # Write back to CSV
+        with open(self.filepath, mode='w', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMN_HEADERS)
+            writer.writeheader()
+            # Sort by FirstSeen descending for readability
+            sorted_history = sorted(history.values(), key=lambda x: x["FirstSeen"], reverse=True)
+            writer.writerows(sorted_history)
+
+    def compute_status(self, first_seen_str, today):
+        try:
+            fs = datetime.strptime(first_seen_str, "%Y-%m-%d").date()
+            days = (today - fs).days
+            if days < 7: return STATUS_NEW
+            if days < 14: return STATUS_1W
+            if days < 21: return STATUS_2W
+            if days < 28: return STATUS_3W
+            return STATUS_4W
+        except:
+            return STATUS_NEW
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Real Estate Scraper for imot.bg")
+    parser.add_argument("--urls", nargs="+", help="List of imot.bg search URLs")
+    parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT, help="Output filename in reports/ folder")
+    args = parser.parse_args()
+    
+    if not args.urls:
+        print("Error: No URLs provided. Use --urls followed by imot.bg links.")
+        return
+
+    # Ensure output ends with .csv
+    output_file = args.output if args.output.endswith(".csv") else f"{args.output}.csv"
+
+    today = date.today()
+    print(f"Starting Scrape - {today}")
+    print(f"Target file: {REPORTS_DIR}/{output_file}")
+    
+    scraped = scrape_all(args.urls)
+    if not scraped:
+        print("No data found.")
+        return
+    
+    store = CSVDataStore(output_file)
+    store.save(scraped, today)
+    print(f"\n✓ Saved successfully to {store.filepath}. Captured {len(scraped)} listings.")
+
+if __name__ == "__main__":
+    main()
