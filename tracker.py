@@ -369,6 +369,32 @@ class GoogleSheetsDataStore:
         except:
             return STATUS_NEW
 
+def save_summary(output_name, scraped_count, today):
+    """Save execution summary to a separate CSV and print to console."""
+    summary_filename = output_name.replace(".csv", "") + "_summary.csv"
+    summary_path = os.path.join(REPORTS_DIR, summary_filename)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    headers = ["Timestamp", "ScrapedCount"]
+    row = {"Timestamp": timestamp, "ScrapedCount": scraped_count}
+    
+    file_exists = os.path.exists(summary_path)
+    
+    with open(summary_path, mode='a', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+    
+    # Print to console
+    print("\n" + "="*30)
+    print("      SCRAPE SUMMARY")
+    print("="*30)
+    print(f"Timestamp: {timestamp}")
+    print(f"Scraped:   {scraped_count} properties")
+    print(f"Report:    {summary_path}")
+    print("="*30)
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -415,6 +441,9 @@ def main():
         
     store.save(scraped, today)
     print(f"\n✓ Saved successfully. Captured {len(scraped)} listings.")
+    
+    # Save and display summary
+    save_summary(args.output, len(scraped), today)
 
 if __name__ == "__main__":
     main()
