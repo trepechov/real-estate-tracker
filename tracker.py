@@ -132,7 +132,68 @@ def scrape_page(page, url):
 
     return properties
 
-def scrape_all(urls):
+def extract_top_metrics(soup):
+    """Extract metrics from the top summary box on the search results page."""
+    metrics = {
+        "TotalResults": 0,
+        "MedianPrice": 0,
+        "MedianSQM": 0
+    }
+    
+    # Total Results
+    # Pattern 1: Намерени са 85 обяви (Sometimes on first page/specific agents)
+    # Pattern 2: от общо 85 обяви (Common in list-info header)
+    text_content = soup.get_text()
+    match = re.search(r"Намерени[^\d]*(\d+)", text_content.replace("\xa0", " ").replace(" ", ""))
+    if not match:
+        match = re.search(r"общо(\d+)обяви", text_content.replace("\xa0", " ").replace(" ", ""))
+    
+    if match:
+        metrics["TotalResults"] = int(match.group(1))
+    
+    # Fallback to specifically checking span/div if needed
+    if metrics["TotalResults"] == 0:
+        for el in soup.select("span, div.list-info"):
+            t = el.get_text().replace(" ", "").replace("\xa0", "")
+            m = re.search(r"(\d+)", t)
+            if "Намерени" in t or "общо" in t:
+                m = re.search(r"(\d+)", t)
+                if m:
+                    metrics["TotalResults"] = int(m.group(1))
+                    break
+
+    # Prices (Median)
+    # The box with 'медианна стойност'
+    summary_box = soup.find("div", class_="params2", style=lambda s: s and "float:right" in s)
+    if summary_box:
+        text = summary_box.get_text(" ", strip=True)
+        # Regex for numbers followed by 'euro'
+        # Group 1: Price, Group 2: SQM Price
+        prices = re.findall(r"([\d\s]+)\s*euro", text)
+        if len(prices) >= 2:
+            metrics["MedianPrice"] = int(re.sub(r"\s+", "", prices[0]))
+            metrics["MedianSQM"] = int(re.sub(r"\s+", "", prices[1]))
+            
+    return metrics
+
+def get_last_summary(output_name):
+    """Load the most recent metrics from the summary CSV."""
+    summary_filename = output_name.replace(".csv", "") + "_summary.csv"
+    summary_path = os.path.join(REPORTS_DIR, summary_filename)
+    
+    if not os.path.exists(summary_path):
+        return None
+        
+    try:
+        with open(summary_path, mode='r', encoding='utf-8') as f:
+            reader = list(csv.DictReader(f))
+            if not reader: return None
+            # Return the last row
+            return reader[-1]
+    except:
+        return None
+
+def scrape_all(urls, optimized=True, output_name=""):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -145,26 +206,49 @@ def scrape_all(urls):
         seen_ids = set()
 
         for base_url in urls:
-            print(f"\nProcessing Search: {base_url}")
+            metrics = {
+                "TotalResults": 0,
+                "MedianPrice": 0,
+                "MedianSQM": 0
+            }
             try:
                 page.goto(base_url, wait_until="networkidle", timeout=60000)
                 soup = BeautifulSoup(page.content(), "html.parser")
                 
+                # Extract site-official metrics
+                metrics = extract_top_metrics(soup)
+                
                 # Get total pages
                 page_links = [a.get_text(strip=True) for a in soup.select("a") if re.match(r"^\d+$", a.get_text(strip=True))]
                 nums = [int(p) for p in page_links if p.isdigit()]
-                total = max(nums) if nums else 1
-                
-                print(f"  Detected {total} pages")
+                total_pages = max(nums) if nums else 1
 
-                for page_num in range(1, total + 1):
+                # OPTIMIZATION CHECK
+                if optimized and output_name:
+                    last = get_last_summary(output_name)
+                    if last:
+                        # Comparison against official site numbers stored in previous summary
+                        if (metrics["TotalResults"] == int(last.get("ScrapedCount", 0)) and
+                            metrics["MedianPrice"] == int(float(last.get("MedianPrice", 0))) and
+                            metrics["MedianSQM"] == int(float(last.get("MedianPriceSQM", 0))) and
+                            total_pages == int(last.get("TotalPages", 0))):
+                            
+                            print(f"  [Smart Check] No changes detected since last run ({metrics['TotalResults']} results, {total_pages} pages). Skipping.")
+                            # Still need to scrape page 1 to return current results for sync
+                            props = scrape_page(page, base_url)
+                            all_props.extend(props)
+                            return all_props, total_pages, metrics
+
+                print(f"  Detected {total_pages} pages")
+
+                for page_num in range(1, total_pages + 1):
                     if page_num == 1:
                         page_url = base_url
                     else:
                         parts = base_url.split("?", 1)
                         page_url = f"{parts[0]}/p-{page_num}?{parts[1]}" if len(parts) > 1 else f"{parts[0]}/p-{page_num}"
                     
-                    print(f"  Scraping Page {page_num}/{total}")
+                    print(f"  Scraping Page {page_num}/{total_pages}")
                     props = scrape_page(page, page_url)
                     for p_dict in props:
                         if p_dict["ID"] not in seen_ids:
@@ -175,7 +259,7 @@ def scrape_all(urls):
                 print(f"  [ERROR] Failed to process {base_url}: {e}")
 
         browser.close()
-        return all_props, total
+        return all_props, total_pages, metrics
 
 # ─────────────────────────────────────────────
 # DATA STORAGE (Abstracted for future Google Sheets)
@@ -393,10 +477,19 @@ def save_summary(output_name, scraped_count, total_pages, median_price, median_s
     }
     
     file_exists = os.path.exists(summary_path)
+    needs_headers = not file_exists
     
-    with open(summary_path, mode='a', encoding='utf-8', newline='') as f:
+    # If file exists but headers are old/wrong, we might want to start fresh or handle it
+    if file_exists:
+        with open(summary_path, 'r') as f:
+            first_line = f.readline()
+            if "TotalPages" not in first_line:
+                needs_headers = True
+    
+    mode = 'w' if needs_headers else 'a'
+    with open(summary_path, mode=mode, encoding='utf-8', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
-        if not file_exists:
+        if needs_headers:
             writer.writeheader()
         writer.writerow(row)
     
@@ -421,6 +514,7 @@ def main():
     parser.add_argument("--urls", nargs="+", help="List of imot.bg search URLs")
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT, help="Output filename in reports/ folder")
     parser.add_argument("--mode", type=str, choices=["csv", "sheets"], default="csv", help="Storage mode: 'csv' (local) or 'sheets' (Google Sheets)")
+    parser.add_argument("--full", action="store_true", help="Force a full scrape, skipping the optimization check")
     args = parser.parse_args()
     
     if not args.urls:
@@ -457,7 +551,7 @@ def main():
         print(f"Target: Local CSV '{REPORTS_DIR}/{output_file}'")
         use_sheets = False
     
-    scraped, total_pages = scrape_all(args.urls)
+    scraped, total_pages, official_metrics = scrape_all(args.urls, optimized=not args.full, output_name=args.output)
     if not scraped:
         print("No data found.")
         return
@@ -470,15 +564,14 @@ def main():
     store.save(scraped, today)
     print(f"\n✓ Saved successfully. Captured {len(scraped)} listings.")
     
-    # Calculate medians
-    prices = [p["Price"] for p in scraped if p.get("Price")]
-    sqms = [p["PriceSQM"] for p in scraped if p.get("PriceSQM")]
-    
-    median_price = statistics.median(prices) if prices else 0
-    median_sqm = statistics.median(sqms) if sqms else 0
+    # Use official site metrics for the summary report
+    # If official metrics are missing (unlikely), fall back to calculation
+    median_price = official_metrics["MedianPrice"] if official_metrics["MedianPrice"] else 0
+    median_sqm = official_metrics["MedianSQM"] if official_metrics["MedianSQM"] else 0
+    scraped_count = official_metrics["TotalResults"] if official_metrics["TotalResults"] else len(scraped)
 
     # Save and display summary
-    save_summary(args.output, len(scraped), total_pages, median_price, median_sqm)
+    save_summary(args.output, scraped_count, total_pages, median_price, median_sqm)
 
 if __name__ == "__main__":
     main()
