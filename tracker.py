@@ -237,7 +237,7 @@ def scrape_all(urls, optimized=True, output_name=""):
                             # Still need to scrape page 1 to return current results for sync
                             props = scrape_page(page, base_url)
                             all_props.extend(props)
-                            return all_props, total_pages, metrics
+                            return all_props, total_pages, metrics, True
 
                 print(f"  Detected {total_pages} pages")
 
@@ -259,7 +259,7 @@ def scrape_all(urls, optimized=True, output_name=""):
                 print(f"  [ERROR] Failed to process {base_url}: {e}")
 
         browser.close()
-        return all_props, total_pages, metrics
+        return all_props, total_pages, metrics, False
 
 # ─────────────────────────────────────────────
 # DATA STORAGE (Abstracted for future Google Sheets)
@@ -461,19 +461,20 @@ class GoogleSheetsDataStore:
         except:
             return STATUS_NEW
 
-def save_summary(output_name, scraped_count, total_pages, median_price, median_sqm):
+def save_summary(output_name, scraped_count, total_pages, median_price, median_sqm, was_skipped):
     """Save execution summary to a separate CSV and print to console."""
     summary_filename = output_name.replace(".csv", "") + "_summary.csv"
     summary_path = os.path.join(REPORTS_DIR, summary_filename)
     
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    headers = ["Timestamp", "ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM"]
+    headers = ["Timestamp", "ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped"]
     row = {
         "Timestamp": timestamp, 
         "ScrapedCount": scraped_count,
         "TotalPages": total_pages,
         "MedianPrice": f"{median_price:.0f}" if median_price else "0",
-        "MedianPriceSQM": f"{median_sqm:.0f}" if median_sqm else "0"
+        "MedianPriceSQM": f"{median_sqm:.0f}" if median_sqm else "0",
+        "WasSkipped": was_skipped
     }
     
     file_exists = os.path.exists(summary_path)
@@ -483,7 +484,7 @@ def save_summary(output_name, scraped_count, total_pages, median_price, median_s
     if file_exists:
         with open(summary_path, 'r') as f:
             first_line = f.readline()
-            if "TotalPages" not in first_line:
+            if "WasSkipped" not in first_line:
                 needs_headers = True
     
     mode = 'w' if needs_headers else 'a'
@@ -502,6 +503,7 @@ def save_summary(output_name, scraped_count, total_pages, median_price, median_s
     print(f"Total Pages:  {total_pages}")
     print(f"Median Price: {row['MedianPrice']} EUR")
     print(f"Median SQM:   {row['MedianPriceSQM']} EUR")
+    print(f"Skipped:      {was_skipped}")
     print(f"Report:       {summary_path}")
     print("="*40)
 
@@ -551,7 +553,7 @@ def main():
         print(f"Target: Local CSV '{REPORTS_DIR}/{output_file}'")
         use_sheets = False
     
-    scraped, total_pages, official_metrics = scrape_all(args.urls, optimized=not args.full, output_name=args.output)
+    scraped, total_pages, official_metrics, was_skipped = scrape_all(args.urls, optimized=not args.full, output_name=args.output)
     if not scraped:
         print("No data found.")
         return
@@ -571,7 +573,7 @@ def main():
     scraped_count = official_metrics["TotalResults"] if official_metrics["TotalResults"] else len(scraped)
 
     # Save and display summary
-    save_summary(args.output, scraped_count, total_pages, median_price, median_sqm)
+    save_summary(args.output, scraped_count, total_pages, median_price, median_sqm, was_skipped)
 
 if __name__ == "__main__":
     main()
