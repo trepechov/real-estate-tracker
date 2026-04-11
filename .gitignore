@@ -2,3 +2,4 @@ reports/
 venv/
 __pycache__/
 *.xlsx
+secrets/

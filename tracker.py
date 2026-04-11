@@ -273,11 +273,18 @@ class GoogleSheetsDataStore:
         self.worksheet = self._get_or_create_worksheet()
 
     def _authenticate(self):
+        # 1. Try Environment Variable (GitHub Actions)
         creds_json = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON")
-        if not creds_json:
-            raise ValueError("GSPREAD_SERVICE_ACCOUNT_JSON environment variable not set.")
-        creds_dict = json.loads(creds_json)
-        return gspread.service_account_from_dict(creds_dict)
+        if creds_json:
+            creds_dict = json.loads(creds_json)
+            return gspread.service_account_from_dict(creds_dict)
+            
+        # 2. Try Local File
+        local_creds_path = os.path.join("secrets", "service_account.json")
+        if os.path.exists(local_creds_path):
+            return gspread.service_account(filename=local_creds_path)
+            
+        raise ValueError("No Google Sheets credentials found. Set GSPREAD_SERVICE_ACCOUNT_JSON or add secrets/service_account.json")
 
     def _get_or_create_worksheet(self):
         try:
@@ -418,7 +425,13 @@ def main():
     
     # Storage selection logic
     sheet_id = os.environ.get("SPREADSHEET_ID")
-    has_creds = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON")
+    if not sheet_id:
+        local_id_path = os.path.join("secrets", "spreadsheet_id.txt")
+        if os.path.exists(local_id_path):
+            with open(local_id_path, "r") as f:
+                sheet_id = f.read().strip()
+
+    has_creds = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON") or os.path.exists(os.path.join("secrets", "service_account.json"))
     
     # Decide using mode flag AND check if sheets config is actually available
     if args.mode == "sheets":
