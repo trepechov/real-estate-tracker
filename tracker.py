@@ -15,6 +15,8 @@ from datetime import date, datetime
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
+import json
+import gspread
 
 # ─────────────────────────────────────────────
 # CONSTANTS & DEFAULTS
@@ -262,6 +264,111 @@ class CSVDataStore:
         except:
             return STATUS_NEW
 
+class GoogleSheetsDataStore:
+    def __init__(self, spreadsheet_id, sheet_name):
+        self.spreadsheet_id = spreadsheet_id
+        self.sheet_name = sheet_name
+        self.gc = self._authenticate()
+        self.spreadsheet = self.gc.open_by_key(self.spreadsheet_id)
+        self.worksheet = self._get_or_create_worksheet()
+
+    def _authenticate(self):
+        creds_json = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON")
+        if not creds_json:
+            raise ValueError("GSPREAD_SERVICE_ACCOUNT_JSON environment variable not set.")
+        creds_dict = json.loads(creds_json)
+        return gspread.service_account_from_dict(creds_dict)
+
+    def _get_or_create_worksheet(self):
+        try:
+            return self.spreadsheet.worksheet(self.sheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            # Create with headers
+            ws = self.spreadsheet.add_worksheet(title=self.sheet_name, rows="100", cols=str(len(COLUMN_HEADERS)))
+            ws.append_row(COLUMN_HEADERS)
+            # Format headers
+            ws.format("A1:N1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}})
+            return ws
+
+    def load_existing(self):
+        """Load history from Sheets."""
+        data = self.worksheet.get_all_records()
+        history = {}
+        for row in data:
+            if row.get("ID"):
+                # Convert numeric fields back from strings if necessary (gspread usually returns strings or auto-typed)
+                history[str(row["ID"])] = {k: str(v) for k, v in row.items()}
+        return history
+
+    def save(self, properties, today):
+        """Update history and save to Sheets."""
+        history = self.load_existing()
+        today_str = today.strftime("%Y-%m-%d")
+        scraped_ids = {str(p["ID"]) for p in properties}
+
+        # 1. Update status for existing
+        for pid, data in history.items():
+            if pid not in scraped_ids:
+                if data["Status"] not in (STATUS_SOLD, STATUS_SOLD_Q):
+                    data["Status"] = STATUS_SOLD
+                    data["DateSold"] = today_str
+                    try:
+                        fs = datetime.strptime(data["FirstSeen"], "%Y-%m-%d").date()
+                        data["DaysMarket"] = str((today - fs).days)
+                    except:
+                        pass
+            else:
+                data["LastSeen"] = today_str
+
+        # 2. Integrate today's scrape
+        for p in properties:
+            pid = str(p["ID"])
+            if pid in history:
+                data = history[pid]
+                data["Price"] = str(p["Price"])
+                data["PriceSQM"] = str(p["PriceSQM"])
+                data["Status"] = self.compute_status(data["FirstSeen"], today)
+                data["LastSeen"] = today_str
+            else:
+                new_row = {h: "" for h in COLUMN_HEADERS}
+                new_row.update({k: str(v) for k, v in p.items()})
+                new_row.update({
+                    "Status": STATUS_NEW,
+                    "FirstSeen": today_str,
+                    "LastSeen": today_str,
+                    "DateSold": "",
+                    "DaysMarket": "",
+                    "vsAvg": "",
+                })
+                history[pid] = new_row
+
+        # Write all back (Overwrite for data integrity and sorting)
+        # Sort by FirstSeen descending
+        sorted_history = sorted(history.values(), key=lambda x: x["FirstSeen"], reverse=True)
+        
+        # Prepare list of lists for gspread
+        all_rows = [COLUMN_HEADERS]
+        for row in sorted_history:
+            all_rows.append([row.get(h, "") for h in COLUMN_HEADERS])
+
+        # Batch update is much faster and stays within API limits
+        self.worksheet.clear()
+        self.worksheet.update("A1", all_rows)
+        print(f"  [Sheets] Updated '{self.sheet_name}' with {len(sorted_history)} total records.")
+
+    def compute_status(self, first_seen_str, today):
+        # Re-using the same logic as CSV but checking for date format
+        try:
+            fs = datetime.strptime(first_seen_str, "%Y-%m-%d").date()
+            days = (today - fs).days
+            if days < 7: return STATUS_NEW
+            if days < 14: return STATUS_1W
+            if days < 21: return STATUS_2W
+            if days < 28: return STATUS_3W
+            return STATUS_4W
+        except:
+            return STATUS_NEW
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -281,16 +388,33 @@ def main():
 
     today = date.today()
     print(f"Starting Scrape - {today}")
-    print(f"Target file: {REPORTS_DIR}/{output_file}")
+    
+    # Check for Google Sheets Config
+    sheet_id = os.environ.get("SPREADSHEET_ID")
+    has_creds = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON")
+    
+    use_sheets = sheet_id and has_creds
+    
+    if use_sheets:
+        # Clean output name for sheet tab (no .csv)
+        sheet_name = args.output.replace(".csv", "") if args.output else "listings"
+        print(f"Target: Google Sheet ID '{sheet_id}' (Tab: '{sheet_name}')")
+    else:
+        output_file = args.output if args.output.endswith(".csv") else f"{args.output}.csv"
+        print(f"Target: Local CSV '{REPORTS_DIR}/{output_file}'")
     
     scraped = scrape_all(args.urls)
     if not scraped:
         print("No data found.")
         return
     
-    store = CSVDataStore(output_file)
+    if use_sheets:
+        store = GoogleSheetsDataStore(sheet_id, sheet_name)
+    else:
+        store = CSVDataStore(output_file)
+        
     store.save(scraped, today)
-    print(f"\n✓ Saved successfully to {store.filepath}. Captured {len(scraped)} listings.")
+    print(f"\n✓ Saved successfully. Captured {len(scraped)} listings.")
 
 if __name__ == "__main__":
     main()

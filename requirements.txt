@@ -3,3 +3,5 @@ playwright-stealth
 beautifulsoup4
 pandas
 lxml
+gspread
+google-auth
