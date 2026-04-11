@@ -617,7 +617,14 @@ def main():
     parser.add_argument("--mode", type=str, choices=["csv", "sheets"], default="csv", help="Storage mode: 'csv' (local) or 'sheets' (Google Sheets)")
     parser.add_argument("--full", action="store_true", help="Force a full scrape, skipping the optimization check")
     args = parser.parse_args()
-    
+
+    # Support both `--urls url1 url2` and `--urls "url1 url2"` (quoted in CI to escape &)
+    if args.urls:
+        urls = []
+        for u in args.urls:
+            urls.extend(u.split())
+        args.urls = urls
+
     if not args.urls:
         print("Error: No URLs provided. Use --urls followed by imot.bg links.")
         return
