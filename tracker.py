@@ -17,6 +17,7 @@ from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 import json
 import gspread
+import statistics
 
 # ─────────────────────────────────────────────
 # CONSTANTS & DEFAULTS
@@ -174,7 +175,7 @@ def scrape_all(urls):
                 print(f"  [ERROR] Failed to process {base_url}: {e}")
 
         browser.close()
-        return all_props
+        return all_props, total
 
 # ─────────────────────────────────────────────
 # DATA STORAGE (Abstracted for future Google Sheets)
@@ -360,7 +361,7 @@ class GoogleSheetsDataStore:
 
         # Batch update is much faster and stays within API limits
         self.worksheet.clear()
-        self.worksheet.update("A1", all_rows)
+        self.worksheet.update(values=all_rows, range_name="A1")
         print(f"  [Sheets] Updated '{self.sheet_name}' with {len(sorted_history)} total records.")
 
     def compute_status(self, first_seen_str, today):
@@ -376,14 +377,20 @@ class GoogleSheetsDataStore:
         except:
             return STATUS_NEW
 
-def save_summary(output_name, scraped_count, today):
+def save_summary(output_name, scraped_count, total_pages, median_price, median_sqm):
     """Save execution summary to a separate CSV and print to console."""
     summary_filename = output_name.replace(".csv", "") + "_summary.csv"
     summary_path = os.path.join(REPORTS_DIR, summary_filename)
     
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    headers = ["Timestamp", "ScrapedCount"]
-    row = {"Timestamp": timestamp, "ScrapedCount": scraped_count}
+    headers = ["Timestamp", "ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM"]
+    row = {
+        "Timestamp": timestamp, 
+        "ScrapedCount": scraped_count,
+        "TotalPages": total_pages,
+        "MedianPrice": f"{median_price:.0f}" if median_price else "0",
+        "MedianPriceSQM": f"{median_sqm:.0f}" if median_sqm else "0"
+    }
     
     file_exists = os.path.exists(summary_path)
     
@@ -394,13 +401,16 @@ def save_summary(output_name, scraped_count, today):
         writer.writerow(row)
     
     # Print to console
-    print("\n" + "="*30)
-    print("      SCRAPE SUMMARY")
-    print("="*30)
-    print(f"Timestamp: {timestamp}")
-    print(f"Scraped:   {scraped_count} properties")
-    print(f"Report:    {summary_path}")
-    print("="*30)
+    print("\n" + "="*40)
+    print("           SCRAPE SUMMARY")
+    print("="*40)
+    print(f"Timestamp:    {timestamp}")
+    print(f"Scraped:      {scraped_count} properties")
+    print(f"Total Pages:  {total_pages}")
+    print(f"Median Price: {row['MedianPrice']} EUR")
+    print(f"Median SQM:   {row['MedianPriceSQM']} EUR")
+    print(f"Report:       {summary_path}")
+    print("="*40)
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -447,7 +457,7 @@ def main():
         print(f"Target: Local CSV '{REPORTS_DIR}/{output_file}'")
         use_sheets = False
     
-    scraped = scrape_all(args.urls)
+    scraped, total_pages = scrape_all(args.urls)
     if not scraped:
         print("No data found.")
         return
@@ -460,8 +470,15 @@ def main():
     store.save(scraped, today)
     print(f"\n✓ Saved successfully. Captured {len(scraped)} listings.")
     
+    # Calculate medians
+    prices = [p["Price"] for p in scraped if p.get("Price")]
+    sqms = [p["PriceSQM"] for p in scraped if p.get("PriceSQM")]
+    
+    median_price = statistics.median(prices) if prices else 0
+    median_sqm = statistics.median(sqms) if sqms else 0
+
     # Save and display summary
-    save_summary(args.output, len(scraped), today)
+    save_summary(args.output, len(scraped), total_pages, median_price, median_sqm)
 
 if __name__ == "__main__":
     main()
