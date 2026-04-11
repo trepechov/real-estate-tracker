@@ -27,9 +27,8 @@ REPORTS_DIR = "reports"
 
 # Column definitions (Schema)
 COLUMN_HEADERS = [
-    "ID", "URL", "Location", "Type", "Area", "FloorTotal",
-    "Price", "PriceSQM", "vsAvg", "Status",
-    "FirstSeen", "DateSold", "DaysMarket", "LastSeen",
+    "ID", "Status", "Price", "PriceSQM", "vsAvg", "Location", "Type", "Area", "FloorTotal",
+    "Broker", "FirstSeen", "DateSold", "DaysMarket", "LastSeen", "URL"
 ]
 
 # Status Labels
@@ -119,6 +118,26 @@ def scrape_page(page, url):
 
         price_per_sqm = round(price_parsed / area) if price_parsed and area else None
 
+        # Broker / Agency Extraction
+        broker = "Частно лице"  # Default to private
+        
+        # 1. Try the direct seller name (User's suggested selector)
+        seller_name_el = item.select_one(".seller .name")
+        if seller_name_el:
+            broker = seller_name_el.get_text(strip=True)
+        else:
+            # 2. Fallback to agency link (subdomain of imot.bg)
+            broker_el = item.select_one('a[href*=".imot.bg"]:not(.saveSlink):not([href*="www.imot.bg"])')
+            if broker_el:
+                name = broker_el.get_text(strip=True)
+                if name:
+                    broker = name
+                else:
+                    # 3. Check for logo img title if text is empty
+                    img = broker_el.select_one("img")
+                    if img and img.get("alt"):
+                        broker = img.get("alt")
+
         properties.append({
             "ID": prop_id,
             "URL": prop_url,
@@ -128,6 +147,7 @@ def scrape_page(page, url):
             "FloorTotal": f"{floor}/{total_floors}" if floor else "",
             "Price": price_parsed,
             "PriceSQM": price_per_sqm,
+            "Broker": broker,
         })
 
     return properties
@@ -189,11 +209,17 @@ def get_last_summary(output_name):
             reader = list(csv.DictReader(f))
             if not reader: return None
             # Return the last row
-            return reader[-1]
+            row = reader[-1]
+            return {
+                "ScrapedCount": int(row.get("ScrapedCount", 0)),
+                "TotalPages": int(row.get("TotalPages", 0)),
+                "MedianPrice": int(float(row.get("MedianPrice", 0))),
+                "MedianPriceSQM": int(float(row.get("MedianPriceSQM", 0)))
+            }
     except:
         return None
 
-def scrape_all(urls, optimized=True, output_name=""):
+def scrape_all(urls, optimized=True, datastore=None):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -224,14 +250,14 @@ def scrape_all(urls, optimized=True, output_name=""):
                 total_pages = max(nums) if nums else 1
 
                 # OPTIMIZATION CHECK
-                if optimized and output_name:
-                    last = get_last_summary(output_name)
+                if optimized and datastore:
+                    last = datastore.get_last_metrics()
                     if last:
-                        # Comparison against official site numbers stored in previous summary
-                        if (metrics["TotalResults"] == int(last.get("ScrapedCount", 0)) and
-                            metrics["MedianPrice"] == int(float(last.get("MedianPrice", 0))) and
-                            metrics["MedianSQM"] == int(float(last.get("MedianPriceSQM", 0))) and
-                            total_pages == int(last.get("TotalPages", 0))):
+                        # Comparison against official site numbers stored in previous run
+                        if (metrics["TotalResults"] == last.get("ScrapedCount") and
+                            metrics["MedianPrice"] == last.get("MedianPrice") and
+                            metrics["MedianSQM"] == last.get("MedianPriceSQM") and
+                            total_pages == last.get("TotalPages")):
                             
                             print(f"  [Smart Check] No changes detected since last run ({metrics['TotalResults']} results, {total_pages} pages). Skipping.")
                             # Still need to scrape page 1 to return current results for sync
@@ -268,7 +294,12 @@ def scrape_all(urls, optimized=True, output_name=""):
 class CSVDataStore:
     def __init__(self, filename):
         os.makedirs(REPORTS_DIR, exist_ok=True)
+        self.filename = filename 
         self.filepath = os.path.join(REPORTS_DIR, filename)
+
+    def get_last_metrics(self):
+        """Standard interface for Smart Check."""
+        return get_last_summary(self.filename)
 
     def load_existing(self):
         """Load history from CSV if it exists."""
@@ -282,7 +313,7 @@ class CSVDataStore:
                 history[row["ID"]] = row
         return history
 
-    def save(self, properties, today):
+    def save(self, properties, today, median_sqm=0):
         """Update history and save to cumulative CSV."""
         history = self.load_existing()
         today_str = today.strftime("%Y-%m-%d")
@@ -313,6 +344,7 @@ class CSVDataStore:
                 data = history[pid]
                 data["Price"] = p["Price"]
                 data["PriceSQM"] = p["PriceSQM"]
+                data["Broker"] = p.get("Broker", data.get("Broker", ""))
                 data["Status"] = self.compute_status(data["FirstSeen"], today)
                 data["LastSeen"] = today_str
             else:
@@ -325,9 +357,19 @@ class CSVDataStore:
                     "LastSeen": today_str,
                     "DateSold": "",
                     "DaysMarket": "",
-                    "vsAvg": "", # Could be calculated if needed
                 })
                 history[pid] = new_row
+
+        # 3. Update vsAvg for all active properties based on current median
+        for pid, data in history.items():
+            if data["Status"] not in (STATUS_SOLD, STATUS_SOLD_Q):
+                try:
+                    p_sqm = int(data.get("PriceSQM", 0))
+                    if median_sqm > 0 and p_sqm > 0:
+                        diff = int(median_sqm - p_sqm)
+                        data["vsAvg"] = f"{'+' if diff > 0 else ''}{diff}"
+                except:
+                    pass
 
         # Write back to CSV
         with open(self.filepath, mode='w', encoding='utf-8', newline='') as f:
@@ -375,30 +417,54 @@ class GoogleSheetsDataStore:
         try:
             return self.spreadsheet.worksheet(self.sheet_name)
         except gspread.exceptions.WorksheetNotFound:
-            # Create with headers
-            ws = self.spreadsheet.add_worksheet(title=self.sheet_name, rows="100", cols=str(len(COLUMN_HEADERS)))
-            ws.append_row(COLUMN_HEADERS)
-            # Format headers
-            ws.format("A1:N1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}})
+            # Create a larger sheet to accommodate the D-column offset
+            ws = self.spreadsheet.add_worksheet(title=self.sheet_name, rows="1000", cols=str(len(COLUMN_HEADERS) + 4))
             return ws
 
+    def get_last_metrics(self):
+        """Read metrics from the summary section (B1:B6)."""
+        try:
+            values = self.worksheet.get("B1:B6")
+            if not values or len(values) < 5: return None
+            return {
+                "ScrapedCount": int(values[1][0]) if len(values[1]) > 0 else 0,
+                "TotalPages": int(values[2][0]) if len(values[2]) > 0 else 0,
+                "MedianPrice": int(float(values[3][0])) if len(values[3]) > 0 else 0,
+                "MedianPriceSQM": int(float(values[4][0])) if len(values[4]) > 0 else 0
+            }
+        except:
+            return None
+
     def load_existing(self):
-        """Load history from Sheets."""
-        data = self.worksheet.get_all_records()
+        """Load history from Sheets, skipping Columns A-C and starting from Column D."""
+        all_values = self.worksheet.get_all_values()
+        if not all_values: return {}
+        
+        # We expect headers at D1
+        header_row = all_values[0]
+        if len(header_row) < 4 or header_row[3] != "ID":
+            # Might be old format or new empty sheet
+            return {}
+
+        headers = header_row[3:] # ID, Price, etc.
         history = {}
-        for row in data:
-            if row.get("ID"):
-                # Convert numeric fields back from strings if necessary (gspread usually returns strings or auto-typed)
-                history[str(row["ID"])] = {k: str(v) for k, v in row.items()}
+        for row_values in all_values[1:]:
+            if len(row_values) > 3:
+                row_data = row_values[3:]
+                # Pad if row is shorter than headers
+                row_data += [""] * (len(headers) - len(row_data))
+                row_dict = {headers[i]: row_data[i] for i in range(len(headers))}
+                if row_dict.get("ID"):
+                    history[str(row_dict["ID"])] = row_dict
         return history
 
-    def save(self, properties, today):
-        """Update history and save to Sheets."""
+    def save(self, properties, today, summary_data=None, median_sqm=0):
+        """Update history and save to Sheets with integrated summary."""
         history = self.load_existing()
         today_str = today.strftime("%Y-%m-%d")
         scraped_ids = {str(p["ID"]) for p in properties}
 
-        # 1. Update status for existing
+        # 1. Update existing/mark sold
         for pid, data in history.items():
             if pid not in scraped_ids:
                 if data["Status"] not in (STATUS_SOLD, STATUS_SOLD_Q):
@@ -419,6 +485,7 @@ class GoogleSheetsDataStore:
                 data = history[pid]
                 data["Price"] = str(p["Price"])
                 data["PriceSQM"] = str(p["PriceSQM"])
+                data["Broker"] = p.get("Broker", data.get("Broker", ""))
                 data["Status"] = self.compute_status(data["FirstSeen"], today)
                 data["LastSeen"] = today_str
             else:
@@ -430,23 +497,66 @@ class GoogleSheetsDataStore:
                     "LastSeen": today_str,
                     "DateSold": "",
                     "DaysMarket": "",
-                    "vsAvg": "",
                 })
                 history[pid] = new_row
 
-        # Write all back (Overwrite for data integrity and sorting)
-        # Sort by FirstSeen descending
+        # 3. Update vsAvg for all active properties
+        for pid, data in history.items():
+            if data["Status"] not in (STATUS_SOLD, STATUS_SOLD_Q):
+                try:
+                    p_sqm = int(float(data.get("PriceSQM", 0)))
+                    if median_sqm > 0 and p_sqm > 0:
+                        diff = int(median_sqm - p_sqm)
+                        data["vsAvg"] = f"{'+' if diff > 0 else ''}{diff}"
+                except:
+                    pass
+
+        # 4. Prepare full table starting from Column D
         sorted_history = sorted(history.values(), key=lambda x: x["FirstSeen"], reverse=True)
         
-        # Prepare list of lists for gspread
-        all_rows = [COLUMN_HEADERS]
-        for row in sorted_history:
-            all_rows.append([row.get(h, "") for h in COLUMN_HEADERS])
+        # Prepare Rows
+        final_rows = []
+        
+        # Header Row (Row 1)
+        header_row = [""] * 3 + COLUMN_HEADERS
+        # Summary Labels and Meta
+        if summary_data:
+            header_row[0] = "Timestamp"
+            header_row[1] = summary_data["Timestamp"]
+        final_rows.append(header_row)
 
-        # Batch update is much faster and stays within API limits
+        # Body Rows
+        summary_labels = ["ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped"]
+        for i, row in enumerate(sorted_history):
+            row_list = [""] * 3 + [row.get(h, "") for h in COLUMN_HEADERS]
+            # Add labels in Column A and values in Column B for first few rows
+            if summary_data and i < len(summary_labels):
+                label = summary_labels[i]
+                row_list[0] = label
+                row_list[1] = str(summary_data.get(label, ""))
+            final_rows.append(row_list)
+        
+        # Handle cases where summary has more rows than properties (rare but possible)
+        if summary_data and len(sorted_history) < len(summary_labels):
+            for i in range(len(sorted_history), len(summary_labels)):
+                label = summary_labels[i]
+                final_rows.append([label, str(summary_data.get(label, "")), "", ""] + [""] * len(COLUMN_HEADERS))
+
+        # Batch update
         self.worksheet.clear()
-        self.worksheet.update(values=all_rows, range_name="A1")
-        print(f"  [Sheets] Updated '{self.sheet_name}' with {len(sorted_history)} total records.")
+        self.worksheet.update(values=final_rows, range_name="A1")
+        
+        # Formatting
+        try:
+            # Table Header D1:Q1 (or whatever width)
+            end_col = chr(ord('A') + len(COLUMN_HEADERS) + 3) if len(COLUMN_HEADERS) + 3 < 26 else "Z"
+            self.worksheet.format(f"D1:{end_col}1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}})
+            # Summary Labels A1:A6
+            self.worksheet.format("A1:A6", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95}})
+        except:
+            pass
+            
+        print(f"  [Sheets] Updated '{self.sheet_name}' with {len(sorted_history)} listings and execution summary.")
 
     def compute_status(self, first_seen_str, today):
         # Re-using the same logic as CSV but checking for date format
@@ -494,18 +604,7 @@ def save_summary(output_name, scraped_count, total_pages, median_price, median_s
             writer.writeheader()
         writer.writerow(row)
     
-    # Print to console
-    print("\n" + "="*40)
-    print("           SCRAPE SUMMARY")
-    print("="*40)
-    print(f"Timestamp:    {timestamp}")
-    print(f"Scraped:      {scraped_count} properties")
-    print(f"Total Pages:  {total_pages}")
-    print(f"Median Price: {row['MedianPrice']} EUR")
-    print(f"Median SQM:   {row['MedianPriceSQM']} EUR")
-    print(f"Skipped:      {was_skipped}")
-    print(f"Report:       {summary_path}")
-    print("="*40)
+    return row
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -553,18 +652,16 @@ def main():
         print(f"Target: Local CSV '{REPORTS_DIR}/{output_file}'")
         use_sheets = False
     
-    scraped, total_pages, official_metrics, was_skipped = scrape_all(args.urls, optimized=not args.full, output_name=args.output)
-    if not scraped:
-        print("No data found.")
-        return
-    
+    # Initialize Store early for optimization check
     if use_sheets:
         store = GoogleSheetsDataStore(sheet_id, sheet_name)
     else:
         store = CSVDataStore(output_file)
         
-    store.save(scraped, today)
-    print(f"\n✓ Saved successfully. Captured {len(scraped)} listings.")
+    scraped, total_pages, official_metrics, was_skipped = scrape_all(args.urls, optimized=not args.full, datastore=store)
+    if not scraped:
+        print("No data found.")
+        return
     
     # Use official site metrics for the summary report
     # If official metrics are missing (unlikely), fall back to calculation
@@ -572,8 +669,33 @@ def main():
     median_sqm = official_metrics["MedianSQM"] if official_metrics["MedianSQM"] else 0
     scraped_count = official_metrics["TotalResults"] if official_metrics["TotalResults"] else len(scraped)
 
-    # Save and display summary
-    save_summary(args.output, scraped_count, total_pages, median_price, median_sqm, was_skipped)
+    # Save summary logic
+    summary_data = save_summary(args.output, scraped_count, total_pages, median_price, median_sqm, was_skipped)
+    
+    # Update console
+    print("\n" + "="*40)
+    print("           SCRAPE SUMMARY")
+    print("="*40)
+    print(f"Timestamp:    {summary_data['Timestamp']}")
+    print(f"Scraped:      {summary_data['ScrapedCount']} properties")
+    print(f"Total Pages:  {summary_data['TotalPages']}")
+    print(f"Median Price: {summary_data['MedianPrice']} EUR")
+    print(f"Median SQM:   {summary_data['MedianPriceSQM']} EUR")
+    print(f"Skipped:      {summary_data['WasSkipped']}")
+    if not use_sheets:
+        print(f"Report:       reports/{output_file.replace('.csv', '')}_summary.csv")
+    else:
+        print(f"Report:       Google Sheets (Summary in A:B)")
+    print("="*40)
+
+    # Save everything to store
+    # For Google Sheets, we pass summary_data for the A:B integration
+    if use_sheets:
+        store.save(scraped, today, summary_data=summary_data, median_sqm=median_sqm)
+    else:
+        store.save(scraped, today, median_sqm=median_sqm)
+        
+    print(f"\n✓ Saved successfully. Captured {len(scraped)} listings.")
 
 if __name__ == "__main__":
     main()
