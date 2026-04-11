@@ -614,7 +614,7 @@ def main():
     parser = argparse.ArgumentParser(description="Real Estate Scraper for imot.bg")
     parser.add_argument("--urls", nargs="+", help="List of imot.bg search URLs")
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT, help="Output filename in reports/ folder")
-    parser.add_argument("--mode", type=str, choices=["csv", "sheets"], default="csv", help="Storage mode: 'csv' (local) or 'sheets' (Google Sheets)")
+    parser.add_argument("--csv", action="store_true", help="Save to local CSV instead of Google Sheets")
     parser.add_argument("--full", action="store_true", help="Force a full scrape, skipping the optimization check")
     args = parser.parse_args()
 
@@ -629,12 +629,9 @@ def main():
         print("Error: No URLs provided. Use --urls followed by imot.bg links.")
         return
 
-    # Ensure output ends with .csv
-    output_file = args.output if args.output.endswith(".csv") else f"{args.output}.csv"
-
     today = date.today()
     print(f"Starting Scrape - {today}")
-    
+
     # Storage selection logic
     sheet_id = os.environ.get("SPREADSHEET_ID")
     if not sheet_id:
@@ -644,20 +641,18 @@ def main():
                 sheet_id = f.read().strip()
 
     has_creds = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON") or os.path.exists(os.path.join("secrets", "service_account.json"))
-    
-    # Decide using mode flag AND check if sheets config is actually available
-    if args.mode == "sheets":
-        if not (sheet_id and has_creds):
-            print("Error: Google Sheets configuration is missing (SPREADSHEET_ID or GSPREAD_SERVICE_ACCOUNT_JSON).")
-            return
-        # Clean output name for sheet tab (no .csv)
+
+    # Default to Google Sheets; fall back to CSV if --csv flag or credentials missing
+    use_sheets = not args.csv and bool(sheet_id and has_creds)
+
+    if use_sheets:
         sheet_name = args.output.replace(".csv", "") if args.output else "listings"
         print(f"Target: Google Sheet ID '{sheet_id}' (Tab: '{sheet_name}')")
-        use_sheets = True
     else:
+        if not args.csv and not (sheet_id and has_creds):
+            print("Warning: Google Sheets credentials not found, falling back to CSV.")
         output_file = args.output if args.output.endswith(".csv") else f"{args.output}.csv"
         print(f"Target: Local CSV '{REPORTS_DIR}/{output_file}'")
-        use_sheets = False
     
     # Initialize Store early for optimization check
     if use_sheets:
@@ -676,8 +671,15 @@ def main():
     median_sqm = official_metrics["MedianSQM"] if official_metrics["MedianSQM"] else 0
     scraped_count = official_metrics["TotalResults"] if official_metrics["TotalResults"] else len(scraped)
 
-    # Save summary logic
-    summary_data = save_summary(args.output, scraped_count, total_pages, median_price, median_sqm, was_skipped)
+    # Save summary to CSV only in local mode (sheets mode has its own summary tab)
+    summary_data = save_summary(args.output, scraped_count, total_pages, median_price, median_sqm, was_skipped) if not use_sheets else {
+        "Timestamp": str(date.today()),
+        "ScrapedCount": scraped_count,
+        "TotalPages": total_pages,
+        "MedianPrice": f"{median_price:.0f}" if median_price else "0",
+        "MedianPriceSQM": f"{median_sqm:.0f}" if median_sqm else "0",
+        "WasSkipped": was_skipped,
+    }
     
     # Update console
     print("\n" + "="*40)

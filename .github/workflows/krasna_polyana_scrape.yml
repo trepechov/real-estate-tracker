@@ -17,9 +17,6 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
     strategy:
       fail-fast: false
       matrix:
@@ -49,17 +46,10 @@ jobs:
         env:
           SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID }}
           GSPREAD_SERVICE_ACCOUNT_JSON: ${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON }}
-        run: python tracker.py --urls "${{ matrix.area.urls }}" --output "${{ matrix.area.name }}" --mode sheets
-
+        run: python tracker.py --urls "${{ matrix.area.urls }}" --output "${{ matrix.area.name }}"
       - name: Run tracker (Manual)
         if: github.event_name == 'workflow_dispatch'
         env:
           SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID }}
           GSPREAD_SERVICE_ACCOUNT_JSON: ${{ secrets.GSPREAD_SERVICE_ACCOUNT_JSON }}
-        run: python tracker.py --urls "${{ github.event.inputs.search_urls }}" --output "${{ github.event.inputs.area_name }}" --mode sheets
-
-      - name: Commit and push changes
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: update daily real estate reports [skip ci]"
-          file_pattern: "reports/*.csv"
+        run: python tracker.py --urls "${{ github.event.inputs.search_urls }}" --output "${{ github.event.inputs.area_name }}"
