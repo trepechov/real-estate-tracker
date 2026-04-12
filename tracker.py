@@ -28,7 +28,7 @@ REPORTS_DIR = "reports"
 # Column definitions (Schema)
 COLUMN_HEADERS = [
     "ID", "Status", "Price", "PriceSQM", "vsAvg", "Location", "Type", "Area", "FloorTotal",
-    "Broker", "FirstSeen", "DateSold", "DaysMarket", "LastSeen", "URL"
+    "Construction", "Year", "Broker", "FirstSeen", "DateSold", "DaysMarket", "LastSeen", "URL"
 ]
 
 # Status Labels
@@ -118,6 +118,22 @@ def scrape_page(page, url):
 
         price_per_sqm = round(price_parsed / area) if price_parsed and area else None
 
+        # Construction Type Extraction
+        c_match = re.search(r"(тухл|панел|епк|пълзящ кофраж|гредоред)", full_text, re.IGNORECASE)
+        construction = ""
+        if c_match:
+            c_text = c_match.group(1).lower()
+            if "тухл" in c_text: construction = "Тухла"
+            elif "панел" in c_text: construction = "Панел"
+            elif "епк" in c_text or "пълзящ" in c_text: construction = "ЕПК"
+            elif "гредоред" in c_text: construction = "Гредоред"
+
+        # Year Extraction
+        year_match = re.search(r"(18\d{2}|19\d{2}|20\d{2})\s*г\.", full_text, re.IGNORECASE)
+        if not year_match:
+            year_match = re.search(r"(18\d{2}|19\d{2}|20\d{2})", full_text)
+        year = int(year_match.group(1)) if year_match else ""
+
         # Broker / Agency Extraction
         broker = "Частно лице"  # Default to private
         
@@ -145,6 +161,8 @@ def scrape_page(page, url):
             "Type": prop_type,
             "Area": area,
             "FloorTotal": f"{floor}/{total_floors}" if floor else "",
+            "Construction": construction,
+            "Year": year,
             "Price": price_parsed,
             "PriceSQM": price_per_sqm,
             "Broker": broker,
@@ -345,6 +363,8 @@ class CSVDataStore:
                 data["Price"] = p["Price"]
                 data["PriceSQM"] = p["PriceSQM"]
                 data["Broker"] = p.get("Broker", data.get("Broker", ""))
+                data["Construction"] = p.get("Construction", data.get("Construction", ""))
+                data["Year"] = p.get("Year", data.get("Year", ""))
                 data["Status"] = self.compute_status(data["FirstSeen"], today)
                 data["LastSeen"] = today_str
             else:
@@ -486,6 +506,8 @@ class GoogleSheetsDataStore:
                 data["Price"] = str(p["Price"])
                 data["PriceSQM"] = str(p["PriceSQM"])
                 data["Broker"] = p.get("Broker", data.get("Broker", ""))
+                data["Construction"] = str(p.get("Construction", data.get("Construction", "")))
+                data["Year"] = str(p.get("Year", data.get("Year", "")))
                 data["Status"] = self.compute_status(data["FirstSeen"], today)
                 data["LastSeen"] = today_str
             else:
@@ -526,7 +548,7 @@ class GoogleSheetsDataStore:
         final_rows.append(header_row)
 
         # Body Rows
-        summary_labels = ["ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped"]
+        summary_labels = ["ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped", "URL"]
         for i, row in enumerate(sorted_history):
             row_list = [""] * 3 + [row.get(h, "") for h in COLUMN_HEADERS]
             # Add labels in Column A and values in Column B for first few rows
@@ -571,37 +593,42 @@ class GoogleSheetsDataStore:
         except:
             return STATUS_NEW
 
-def save_summary(output_name, scraped_count, total_pages, median_price, median_sqm, was_skipped):
+def save_summary(output_name, scraped_count, total_pages, median_price, median_sqm, was_skipped, search_urls=""):
     """Save execution summary to a separate CSV and print to console."""
     summary_filename = output_name.replace(".csv", "") + "_summary.csv"
     summary_path = os.path.join(REPORTS_DIR, summary_filename)
     
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    headers = ["Timestamp", "ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped"]
+    headers = ["Timestamp", "ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped", "URL"]
     row = {
         "Timestamp": timestamp, 
         "ScrapedCount": scraped_count,
         "TotalPages": total_pages,
         "MedianPrice": f"{median_price:.0f}" if median_price else "0",
         "MedianPriceSQM": f"{median_sqm:.0f}" if median_sqm else "0",
-        "WasSkipped": was_skipped
+        "WasSkipped": was_skipped,
+        "URL": search_urls
     }
     
     file_exists = os.path.exists(summary_path)
     needs_headers = not file_exists
     
-    # If file exists but headers are old/wrong, we might want to start fresh or handle it
+    existing_rows = []
     if file_exists:
-        with open(summary_path, 'r') as f:
-            first_line = f.readline()
-            if "WasSkipped" not in first_line:
+        with open(summary_path, 'r', encoding='utf-8') as f:
+            reader = list(csv.DictReader(f))
+            if reader and ("URL" not in reader[0] or "WasSkipped" not in reader[0]):
                 needs_headers = True
-    
+                existing_rows = reader
+            
     mode = 'w' if needs_headers else 'a'
     with open(summary_path, mode=mode, encoding='utf-8', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         if needs_headers:
             writer.writeheader()
+            for r in existing_rows:
+                complete_row = {h: r.get(h, "") for h in headers}
+                writer.writerow(complete_row)
         writer.writerow(row)
     
     return row
@@ -671,14 +698,17 @@ def main():
     median_sqm = official_metrics["MedianSQM"] if official_metrics["MedianSQM"] else 0
     scraped_count = official_metrics["TotalResults"] if official_metrics["TotalResults"] else len(scraped)
 
+    search_urls_str = " ".join(args.urls)
+
     # Save summary to CSV only in local mode (sheets mode has its own summary tab)
-    summary_data = save_summary(args.output, scraped_count, total_pages, median_price, median_sqm, was_skipped) if not use_sheets else {
-        "Timestamp": str(date.today()),
+    summary_data = save_summary(args.output, scraped_count, total_pages, median_price, median_sqm, was_skipped, search_urls_str) if not use_sheets else {
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "ScrapedCount": scraped_count,
         "TotalPages": total_pages,
         "MedianPrice": f"{median_price:.0f}" if median_price else "0",
         "MedianPriceSQM": f"{median_sqm:.0f}" if median_sqm else "0",
         "WasSkipped": was_skipped,
+        "URL": search_urls_str
     }
     
     # Update console
