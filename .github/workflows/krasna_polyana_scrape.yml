@@ -20,9 +20,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        area: 
+        area:
           - name: "krasna_polyana"
             urls: "https://www.imot.bg/obiavi/prodazhbi/grad-sofiya/krasna-polyana-1/dvustaen?type_home=3~&raioni=112~113~ https://www.imot.bg/obiavi/prodazhbi/grad-sofiya/krasna-polyana-1/tristaen?type_home=3~&raioni=112~113~"
+          - name: "mladost4_300k"
+            urls: "https://www.imot.bg/obiavi/prodazhbi/grad-sofiya/mladost-4/tristaen?price_max=300000"
+          - name: "iztok"
+            urls: "https://www.imot.bg/obiavi/prodazhbi/grad-sofiya/iztok/dvustaen?type_home=3~"
 
     steps:
       - name: Checkout repository
