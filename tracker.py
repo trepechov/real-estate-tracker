@@ -332,7 +332,7 @@ class CSVDataStore:
                 history[row["ID"]] = row
         return history
 
-    def save(self, properties, today, median_sqm=0):
+    def save(self, properties, today, median_sqm=0, was_skipped=False):
         """Update history and save to cumulative CSV."""
         history = self.load_existing()
         today_str = today.strftime("%Y-%m-%d")
@@ -341,8 +341,9 @@ class CSVDataStore:
         # 1. Update existing and mark sold
         for pid, data in history.items():
             if pid not in scraped_ids:
-                # Mark as sold if not previously sold
-                if data["Status"] not in (STATUS_SOLD, STATUS_SOLD_Q):
+                # Only mark sold on full scrapes — partial (optimized) scrapes return only
+                # page 1, so absent IDs just mean "not on page 1", not "sold".
+                if not was_skipped and data["Status"] not in (STATUS_SOLD, STATUS_SOLD_Q):
                     data["Status"] = STATUS_SOLD
                     data["DateSold"] = today_str
                     # Compute days on market
@@ -479,7 +480,7 @@ class GoogleSheetsDataStore:
                     history[str(row_dict["ID"])] = row_dict
         return history
 
-    def save(self, properties, today, summary_data=None, median_sqm=0):
+    def save(self, properties, today, summary_data=None, median_sqm=0, was_skipped=False):
         """Update history and save to Sheets with integrated summary."""
         history = self.load_existing()
         today_str = today.strftime("%Y-%m-%d")
@@ -488,7 +489,9 @@ class GoogleSheetsDataStore:
         # 1. Update existing/mark sold
         for pid, data in history.items():
             if pid not in scraped_ids:
-                if data["Status"] not in (STATUS_SOLD, STATUS_SOLD_Q):
+                # Only mark sold on full scrapes — partial (optimized) scrapes return only
+                # page 1, so absent IDs just mean "not on page 1", not "sold".
+                if not was_skipped and data["Status"] not in (STATUS_SOLD, STATUS_SOLD_Q):
                     data["Status"] = STATUS_SOLD
                     data["DateSold"] = today_str
                     try:
@@ -740,9 +743,9 @@ def main():
     # Save everything to store
     # For Google Sheets, we pass summary_data for the A:B integration
     if use_sheets:
-        store.save(scraped, today, summary_data=summary_data, median_sqm=median_sqm)
+        store.save(scraped, today, summary_data=summary_data, median_sqm=median_sqm, was_skipped=was_skipped)
     else:
-        store.save(scraped, today, median_sqm=median_sqm)
+        store.save(scraped, today, median_sqm=median_sqm, was_skipped=was_skipped)
         
     print(f"\n✓ Saved successfully. Captured {len(scraped)} listings.")
 
