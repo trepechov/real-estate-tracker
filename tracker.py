@@ -12,6 +12,7 @@ import os
 import argparse
 import csv
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
@@ -548,7 +549,7 @@ class GoogleSheetsDataStore:
         final_rows.append(header_row)
 
         # Body Rows
-        summary_labels = ["ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped", "URL"]
+        summary_labels = ["ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped", "URL", "Duration"]
         for i, row in enumerate(sorted_history):
             row_list = [""] * 3 + [row.get(h, "") for h in COLUMN_HEADERS]
             # Add labels in Column A and values in Column B for first few rows
@@ -574,7 +575,7 @@ class GoogleSheetsDataStore:
             end_col = chr(ord('A') + len(COLUMN_HEADERS) + 3) if len(COLUMN_HEADERS) + 3 < 26 else "Z"
             self.worksheet.format(f"D1:{end_col}1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}})
             # Summary Labels A1:A6
-            self.worksheet.format("A1:A6", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95}})
+            self.worksheet.format("A1:A8", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95}})
         except:
             pass
             
@@ -593,26 +594,29 @@ class GoogleSheetsDataStore:
         except:
             return STATUS_NEW
 
-def save_summary(output_name, scraped_count, total_pages, median_price, median_sqm, was_skipped, search_urls=""):
+def save_summary(output_name, scraped_count, total_pages, median_price, median_sqm, was_skipped, search_urls="", duration_seconds=0):
     """Save execution summary to a separate CSV and print to console."""
     summary_filename = output_name.replace(".csv", "") + "_summary.csv"
     summary_path = os.path.join(REPORTS_DIR, summary_filename)
-    
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    headers = ["Timestamp", "ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped", "URL"]
+
+    timestamp = datetime.now(ZoneInfo("Europe/Sofia")).strftime("%Y-%m-%d %H:%M:%S")
+    mins, secs = divmod(int(duration_seconds), 60)
+    duration_str = f"{mins}m {secs}s"
+    headers = ["Timestamp", "ScrapedCount", "TotalPages", "MedianPrice", "MedianPriceSQM", "WasSkipped", "URL", "Duration"]
     row = {
-        "Timestamp": timestamp, 
+        "Timestamp": timestamp,
         "ScrapedCount": scraped_count,
         "TotalPages": total_pages,
         "MedianPrice": f"{median_price:.0f}" if median_price else "0",
         "MedianPriceSQM": f"{median_sqm:.0f}" if median_sqm else "0",
         "WasSkipped": was_skipped,
-        "URL": search_urls
+        "URL": search_urls,
+        "Duration": duration_str
     }
-    
+
     file_exists = os.path.exists(summary_path)
     needs_headers = not file_exists
-    
+
     existing_rows = []
     if file_exists:
         with open(summary_path, 'r', encoding='utf-8') as f:
@@ -620,7 +624,7 @@ def save_summary(output_name, scraped_count, total_pages, median_price, median_s
             if reader and ("URL" not in reader[0] or "WasSkipped" not in reader[0]):
                 needs_headers = True
                 existing_rows = reader
-            
+
     mode = 'w' if needs_headers else 'a'
     with open(summary_path, mode=mode, encoding='utf-8', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
@@ -630,7 +634,7 @@ def save_summary(output_name, scraped_count, total_pages, median_price, median_s
                 complete_row = {h: r.get(h, "") for h in headers}
                 writer.writerow(complete_row)
         writer.writerow(row)
-    
+
     return row
 
 # ─────────────────────────────────────────────
@@ -657,6 +661,7 @@ def main():
         return
 
     today = date.today()
+    start_time = time.time()
     print(f"Starting Scrape - {today}")
 
     # Storage selection logic
@@ -699,16 +704,20 @@ def main():
     scraped_count = official_metrics["TotalResults"] if official_metrics["TotalResults"] else len(scraped)
 
     search_urls_str = " ".join(args.urls)
+    elapsed = time.time() - start_time
+    mins, secs = divmod(int(elapsed), 60)
+    duration_str = f"{mins}m {secs}s"
 
     # Save summary to CSV only in local mode (sheets mode has its own summary tab)
-    summary_data = save_summary(args.output, scraped_count, total_pages, median_price, median_sqm, was_skipped, search_urls_str) if not use_sheets else {
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    summary_data = save_summary(args.output, scraped_count, total_pages, median_price, median_sqm, was_skipped, search_urls_str, elapsed) if not use_sheets else {
+        "Timestamp": datetime.now(ZoneInfo("Europe/Sofia")).strftime("%Y-%m-%d %H:%M:%S"),
         "ScrapedCount": scraped_count,
         "TotalPages": total_pages,
         "MedianPrice": f"{median_price:.0f}" if median_price else "0",
         "MedianPriceSQM": f"{median_sqm:.0f}" if median_sqm else "0",
         "WasSkipped": was_skipped,
-        "URL": search_urls_str
+        "URL": search_urls_str,
+        "Duration": duration_str
     }
     
     # Update console
@@ -721,6 +730,7 @@ def main():
     print(f"Median Price: {summary_data['MedianPrice']} EUR")
     print(f"Median SQM:   {summary_data['MedianPriceSQM']} EUR")
     print(f"Skipped:      {summary_data['WasSkipped']}")
+    print(f"Duration:     {summary_data['Duration']}")
     if not use_sheets:
         print(f"Report:       reports/{output_file.replace('.csv', '')}_summary.csv")
     else:
